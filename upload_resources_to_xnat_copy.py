@@ -10,11 +10,13 @@ Modes:
   - MODE="both":      do both
 
 Scan mapping:
-  1) Checks if the XNAT session already contains scans IDs 
-  2) Otherwise (or if no match), optionally use a scan number embedded in the folder name
-     (prefix or suffix or last numeric group) BUT ONLY if that scan ID is not already used
-     by an existing scan.
-  3) Otherwise assign new IDs deterministically.
+  1) Folders WITH a leading scan number (for example "016 - ...") are treated as
+     already-numbered locally and are NOT matched to existing XNAT scans by type.
+  2) Folders WITHOUT a leading scan number may be matched to an existing XNAT scan
+     by scan type.
+  3) If no type match is made, optionally use a scan number embedded in the folder
+     name, but only if that scan ID is not already used by an existing scan.
+  4) Otherwise assign new IDs deterministically.
 
 Preflight:
   - Prints whether each folder contains a scan number (prefix/suffix/anywhere) and the chosen candidate.
@@ -154,6 +156,20 @@ def _strip_leading_scan_id(folder_name: str) -> str:
     if tail is None or tail.strip() == "":
         return str(m.group(1))
     return tail.strip()
+
+
+def _leading_scan_id(folder_name: str) -> Optional[int]:
+    """
+    Return a leading scan number only if the folder clearly begins with one,
+    e.g. '016 - something' or '016_something' or just '016'.
+    """
+    m = re.match(r"^\s*(\d+)(?:$|[_\-\s]+.*)", folder_name)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
 
 
 def _is_dicom_file(p: Path) -> bool:
@@ -419,7 +435,6 @@ def dicom_postcheck_summary(sess: requests.Session, experiment_id: str, scan_id:
     fmt = None
     content = None
     if dicom_meta:
-        # typical keys: file_count / format / content
         for k in ("file_count", "filecount", "FileCount"):
             if k in dicom_meta:
                 try:
@@ -430,7 +445,6 @@ def dicom_postcheck_summary(sess: requests.Session, experiment_id: str, scan_id:
         fmt = dicom_meta.get("format")
         content = dicom_meta.get("content")
 
-    # If file_count is huge, don't fetch all names
     fetch_limit = None
     if isinstance(file_count, int) and file_count > POSTCHECK_MAX_FETCH_FILES:
         fetch_limit = POSTCHECK_LIST_FIRST_N
@@ -467,7 +481,6 @@ def wait_for_dicom_extraction(sess: requests.Session, experiment_id: str, scan_i
         try:
             last = dicom_postcheck_summary(sess, experiment_id, scan_id)
             nonzip_ok = bool(last.get("contains_nonzip", False)) and int(last.get("nonzip_count", 0)) >= expected_min_nonzip
-            # If listing was truncated, we can only trust "contains_nonzip" not exact count
             if last.get("truncated_listing", False):
                 nonzip_ok = bool(last.get("contains_nonzip", False))
             if nonzip_ok:
@@ -551,11 +564,12 @@ def build_scan_id_map(
     existing_scans: List[Dict[str, str]],
 ) -> Dict[str, str]:
     """
-    Prefer matching by existing XNAT scan "type". If not matched, optionally use scan number in name
-    BUT ONLY if that scan ID is not already used by an existing scan (safety).
-    Otherwise allocate new IDs deterministically.
+    Option B behaviour:
+      - If a local folder has a leading scan number, do NOT type-match it to an existing XNAT scan.
+      - Only folders without a leading scan number are eligible for type-matching.
+      - Unmatched folders may then use an embedded scan number if allowed and safe.
+      - Remaining folders are assigned new IDs deterministically.
     """
-    # Existing scans by type (case-insensitive)
     type_to_id: Dict[str, str] = {}
     dup_types: Dict[str, List[str]] = {}
     used_ids: set[int] = set()
@@ -574,7 +588,7 @@ def build_scan_id_map(
             else:
                 type_to_id[k] = sid
 
-    # If duplicates exist for a type, disable type-matching for that type to avoid ambiguity
+    # Disable type matching for ambiguous duplicate types
     for k in list(dup_types.keys()):
         type_to_id.pop(k, None)
 
@@ -582,9 +596,12 @@ def build_scan_id_map(
     taken_local: set[str] = set()
     taken_ids_by_local: Dict[str, str] = {}
 
-    # Pass 1: match by type
+    # Pass 1: type-match only folders that do NOT already have a leading scan number
     for sdir in scan_dirs:
         name = sdir.name
+        if _leading_scan_id(name) is not None:
+            continue
+
         k1 = _norm_key(name)
         k2 = _norm_key(_strip_leading_scan_id(name))
         match = None
@@ -598,22 +615,28 @@ def build_scan_id_map(
             taken_local.add(name)
             taken_ids_by_local[name] = str(match)
 
-    # Pass 2: use scan number in name (if enabled and not type-matched)
+    # Pass 2: use embedded scan number for anything still unmatched
     if USE_SCAN_NUMBER_IF_NO_TYPE_MATCH:
         for sdir in scan_dirs:
             name = sdir.name
             if name in taken_local:
                 continue
-            info = _scan_number_info(name)
-            chosen = info.get("chosen", None)
-            if chosen is None:
-                continue
-            try:
-                cid = int(chosen)
-            except Exception:
-                continue
 
-            # SAFETY: if XNAT already has scan cid, do NOT map onto it unless we matched by type.
+            # For already-numbered folders, force use of the leading number
+            lead_id = _leading_scan_id(name)
+            if lead_id is not None:
+                cid = lead_id
+            else:
+                info = _scan_number_info(name)
+                chosen = info.get("chosen", None)
+                if chosen is None:
+                    continue
+                try:
+                    cid = int(chosen)
+                except Exception:
+                    continue
+
+            # Safety: do not map onto an existing XNAT scan ID unless we matched by type
             if cid in used_ids:
                 continue
 
@@ -711,12 +734,14 @@ def main() -> int:
             prefix = info["prefix"]
             suffix = info["suffix"]
             chosen = info["chosen"]
+            lead = _leading_scan_id(sdir.name)
             if not groups:
                 missing += 1
                 print(f"  - {sdir.name}: NO DIGITS FOUND")
             else:
                 print(
-                    f"  - {sdir.name}: groups={groups} | prefix={prefix} | suffix={suffix} | chosen({SCAN_NUMBER_PICK_MODE})={chosen}"
+                    f"  - {sdir.name}: groups={groups} | prefix={prefix} | suffix={suffix} "
+                    f"| chosen({SCAN_NUMBER_PICK_MODE})={chosen} | leading_scan_id={lead}"
                 )
         if missing:
             print(f"WARNING: {missing} folder(s) had no digits at all; they will rely on type-match or new ID allocation.")
@@ -726,14 +751,12 @@ def main() -> int:
     xnat.auth = HTTPBasicAuth(USERNAME, PASSWORD)
     xnat.verify = VERIFY_SSL
 
-    # Quick auth sanity check
     ping = _api(BASE_URL, "/data/projects")
     r = xnat.get(ping, params={"format": "json"}, timeout=REQUEST_TIMEOUT)
     if r.status_code >= 400:
         print(f"ERROR: Cannot access {ping} ({r.status_code}). Check URL/credentials/SSL.\n{r.text[:300]}")
         return 3
 
-    # Ensure subject + session exist (never overwrite)
     try:
         ensure_subject(xnat, PROJECT_ID, SUBJECT_ID)
         exp_id = ensure_session(xnat, PROJECT_ID, SUBJECT_ID, SESSION_LABEL, SESSION_DATE)
@@ -820,7 +843,6 @@ def main() -> int:
                         except Exception as e:
                             print(f"  !! DICOM upload failed for scan {scan_id}: {e}")
 
-                # Post-check (and optional wait) before pullDataFromHeaders
                 if POSTCHECK_DICOM and not str(exp_id).startswith("DRYRUN_"):
                     try:
                         print("  Postcheck: DICOM resource status")
@@ -834,7 +856,6 @@ def main() -> int:
                     except Exception as e:
                         print(f"  Postcheck WARNING: {e}")
 
-                # Pull headers at scan level (if configured)
                 if PULL_HEADERS_AFTER_DICOM and PULL_HEADERS_LEVEL == "scan":
                     try:
                         pull_data_from_headers_scan(xnat, exp_id, scan_id)
@@ -884,7 +905,6 @@ def main() -> int:
 
         print()
 
-    # Session-level pullDataFromHeaders (recommended if you uploaded many scans)
     if mode in {"dicom", "both"} and PULL_HEADERS_AFTER_DICOM and PULL_HEADERS_LEVEL == "session":
         if dicom_uploaded_any and not str(exp_id).startswith("DRYRUN_"):
             try:
