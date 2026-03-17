@@ -4,13 +4,24 @@ xnat_sync_bypass_transfer.py
 
 "XNAT A -> local staging -> XNAT B" transfer.
 
-Can be run in DICOM mode or RESOURCE mode (if DICOM already exists, skip DICOM.
-                                           Do both if choose to include DICOM).
+Preserves scan-level metadata where present, including:
+- type
+- series_description
+- quality
+- note
 
+New features
+------------
+1) Credentials are prompted at runtime via pop-up windows (GUI), so they are
+   no longer hard-coded into the script.
+2) Direction control:
+      DIRECTION = "forwards"   -> A acts as source, B acts as destination
+      DIRECTION = "backwards"  -> B acts as source, A acts as destination
 """
 
 from __future__ import annotations
 
+import getpass
 import logging
 import re
 import shutil
@@ -25,19 +36,20 @@ import requests
 # =========================
 # USER CONFIG
 # =========================
-# SRC and DST
 
-SRC_BASE_URL = ""
-DST_BASE_URL = ""
+# -------------------------
+# Fixed endpoint definitions
+# -------------------------
+A_BASE_URL = ""
+A_PROJECT = ""
 
-SRC_PROJECT = ""
-DST_PROJECT = ""
+B_BASE_URL = ""
+B_PROJECT = ""
 
-SRC_USER = ""
-SRC_PASS = ""
-
-DST_USER = ""
-DST_PASS = ""
+# Direction of transfer:
+#   "forwards"  = A -> B
+#   "backwards" = B -> A
+DIRECTION = "forwards"
 
 # Subjects to transfer (labels)
 SUBJECT_LABELS = [""]
@@ -45,7 +57,7 @@ SUBJECT_LABELS = [""]
 # Optional: only process sessions whose label matches this regex (None = all)
 SESSION_LABEL_REGEX = None  # e.g. r"^\d{3}_MR_\d+$", r"^[A-Za-z0-9]+_MR_\d+$"
 
-STAGING_DIR = Path(r"")
+STAGING_DIR = Path(r"D:\Downloads\XNAT_transfer_staging")
 
 PHASE = "resources"   # "dicom" or "resources"
 DRY_RUN = False       # True = no PUT/POST, only GET + plan
@@ -61,6 +73,13 @@ SKIP_EXISTING = True
 #   "scan"    = call pullDataFromHeaders per scan (with retries + waits)
 #   "session" = call pullDataFromHeaders once per session (recommended)
 PULL_HEADERS_MODE = "session"
+
+# Preserve source scan metadata such as type / series_description / quality / note
+PRESERVE_SCAN_METADATA = True
+
+# After pullDataFromHeaders, re-apply preserved source scan metadata.
+# Recommended True when source has meaningful custom scan type labels.
+REAPPLY_SCAN_METADATA_AFTER_PULL = True
 
 # After upload+extract, refresh catalog so extracted files are added to catalog entries.
 REFRESH_CATALOG_AFTER_UPLOAD = True
@@ -120,9 +139,26 @@ RETRYABLE_ERROR_SUBSTRINGS = (
     "503",
 )
 
+# -------------------------
+# Active runtime mapping
+# -------------------------
+# These are populated automatically from A/B + DIRECTION in main().
+SRC_BASE_URL = ""
+DST_BASE_URL = ""
+SRC_PROJECT = ""
+DST_PROJECT = ""
+
+SOURCE_SIDE_NAME = ""
+DEST_SIDE_NAME = ""
+
+
 # =========================
 # END USER CONFIG
 # =========================
+
+
+class CredentialPromptCancelled(Exception):
+    """Raised when the user cancels credential entry."""
 
 
 def setup_logging() -> None:
@@ -133,6 +169,134 @@ def setup_logging() -> None:
     )
 
 
+def resolve_direction() -> Tuple[str, str]:
+    """
+    Resolve A/B into active source/destination settings based on DIRECTION.
+    Populates global SRC_* / DST_* variables so the rest of the script can
+    continue to use them.
+    """
+    global SRC_BASE_URL, DST_BASE_URL, SRC_PROJECT, DST_PROJECT
+    global SOURCE_SIDE_NAME, DEST_SIDE_NAME
+
+    d = str(DIRECTION).strip().lower()
+
+    if d == "forwards":
+        SRC_BASE_URL = A_BASE_URL
+        SRC_PROJECT = A_PROJECT
+        DST_BASE_URL = B_BASE_URL
+        DST_PROJECT = B_PROJECT
+        SOURCE_SIDE_NAME = "A"
+        DEST_SIDE_NAME = "B"
+    elif d in {"backwards"}:
+        SRC_BASE_URL = B_BASE_URL
+        SRC_PROJECT = B_PROJECT
+        DST_BASE_URL = A_BASE_URL
+        DST_PROJECT = A_PROJECT
+        SOURCE_SIDE_NAME = "B"
+        DEST_SIDE_NAME = "A"
+    else:
+        raise ValueError(
+            "DIRECTION must be 'forwards' or 'backwards' "
+        )
+
+    return SOURCE_SIDE_NAME, DEST_SIDE_NAME
+
+
+def validate_runtime_config() -> None:
+    missing = []
+
+    if not _clean_text(A_BASE_URL):
+        missing.append("A_BASE_URL")
+    if not _clean_text(A_PROJECT):
+        missing.append("A_PROJECT")
+    if not _clean_text(B_BASE_URL):
+        missing.append("B_BASE_URL")
+    if not _clean_text(B_PROJECT):
+        missing.append("B_PROJECT")
+
+    if missing:
+        raise ValueError("Missing required config values: " + ", ".join(missing))
+
+    if PHASE not in {"dicom", "resources"}:
+        raise ValueError("PHASE must be 'dicom' or 'resources'")
+
+
+def _prompt_credentials_gui(endpoint_label: str, base_url: str) -> Tuple[str, str]:
+    """
+    Prompt for username/password using pop-up windows.
+    """
+    import tkinter as tk
+    from tkinter import messagebox, simpledialog
+
+    root = tk.Tk()
+    root.withdraw()
+
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    try:
+        while True:
+            user = simpledialog.askstring(
+                title="XNAT Login",
+                prompt=f"Enter username for {endpoint_label}\n{base_url}",
+                parent=root,
+            )
+            if user is None:
+                raise CredentialPromptCancelled(f"Credential entry cancelled for {endpoint_label}.")
+            user = user.strip()
+            if user:
+                break
+            messagebox.showerror("Missing username", f"Username for {endpoint_label} cannot be empty.", parent=root)
+
+        while True:
+            password = simpledialog.askstring(
+                title="XNAT Login",
+                prompt=f"Enter password for {endpoint_label}\n{base_url}",
+                parent=root,
+                show="*",
+            )
+            if password is None:
+                raise CredentialPromptCancelled(f"Credential entry cancelled for {endpoint_label}.")
+            if password:
+                break
+            messagebox.showerror("Missing password", f"Password for {endpoint_label} cannot be empty.", parent=root)
+
+        return user, password
+
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def prompt_credentials(endpoint_label: str, base_url: str) -> Tuple[str, str]:
+    """
+    Ask for credentials. Uses a GUI popup when available, with a terminal fallback.
+    """
+    try:
+        return _prompt_credentials_gui(endpoint_label, base_url)
+    except CredentialPromptCancelled:
+        raise
+    except Exception as e:
+        logging.warning(
+            f"[AUTH] GUI credential prompt unavailable for {endpoint_label}: {e}. "
+            f"Falling back to terminal input."
+        )
+
+        user = input(f"Enter username for {endpoint_label} ({base_url}): ").strip()
+        if not user:
+            raise CredentialPromptCancelled(f"Username entry cancelled/empty for {endpoint_label}.")
+
+        password = getpass.getpass(f"Enter password for {endpoint_label} ({base_url}): ").strip()
+        if not password:
+            raise CredentialPromptCancelled(f"Password entry cancelled/empty for {endpoint_label}.")
+
+        return user, password
+
+
 def _sleep_backoff(attempt: int) -> None:
     time.sleep(RETRY_BACKOFF_BASE_SEC * attempt)
 
@@ -140,6 +304,13 @@ def _sleep_backoff(attempt: int) -> None:
 def _is_retryable_error(msg: str) -> bool:
     m = (msg or "").lower()
     return any(s.lower() in m for s in RETRYABLE_ERROR_SUBSTRINGS)
+
+
+def _clean_text(v: object) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
 
 
 def validate_zip(zip_path: Path) -> bool:
@@ -182,7 +353,7 @@ def _strip_prefix_to_resource_files(member_path: str, resource_label: str) -> Op
     idx = p.find(marker)
     if idx < 0:
         return None
-    return p[idx + len(marker) :]
+    return p[idx + len(marker):]
 
 
 def normalize_zip_to_resource_files_root(zip_in: Path, resource_label: str) -> Tuple[Path, int]:
@@ -199,7 +370,6 @@ def normalize_zip_to_resource_files_root(zip_in: Path, resource_label: str) -> T
 
     zip_out = zip_in.with_name(zip_in.stem + "__normalized.zip")
 
-    # Build list of (final_name, info, was_rewritten)
     entries: List[Tuple[str, zipfile.ZipInfo, bool]] = []
 
     with zipfile.ZipFile(zip_in, "r") as zin:
@@ -223,7 +393,6 @@ def normalize_zip_to_resource_files_root(zip_in: Path, resource_label: str) -> T
 
         rewritten = sum(1 for _, _, w in entries if w)
 
-        # Ensure uniqueness after mapping
         name_counts: Dict[str, int] = {}
 
         with zipfile.ZipFile(zip_out, "w", compression=zipfile.ZIP_DEFLATED) as zout:
@@ -246,7 +415,6 @@ def normalize_zip_to_resource_files_root(zip_in: Path, resource_label: str) -> T
             pass
         raise RuntimeError(f"Normalised zip failed validation: {zip_out}")
 
-    # If nothing changed, keep original to avoid churn
     if rewritten == 0:
         try:
             zip_out.unlink()
@@ -349,11 +517,6 @@ def prepare_zip_for_upload(zip_path: Path) -> List[Path]:
     return [zip_path]
 
 
-# ----------------------------------------------------------------------
-# Everything below here is unchanged from your version
-# (XNAT class, enumeration, transfer loops, etc.)
-# ----------------------------------------------------------------------
-
 class XNAT:
     def __init__(self, base_url: str, user: str, password: str, verify_tls: bool = True):
         self.base_url = base_url.rstrip("/")
@@ -435,6 +598,91 @@ def rs_result_list(d: Dict) -> List[Dict]:
     return d.get("ResultSet", {}).get("Result", []) or []
 
 
+# -------- Scan metadata preservation helpers --------
+
+def build_scan_metadata_from_row(scan_row: Dict) -> Dict[str, str]:
+    """
+    Extract source scan metadata that should be preserved on destination.
+    """
+    meta: Dict[str, str] = {}
+
+    xsi_type = _clean_text(scan_row.get("xsiType")) or "xnat:mrScanData"
+    meta["xsiType"] = xsi_type
+
+    for key in ("type", "series_description", "quality", "note"):
+        val = _clean_text(scan_row.get(key))
+        if val:
+            meta[key] = val
+
+    return meta
+
+
+def build_scan_put_params(scan_meta: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """
+    Build query-string params for creating/updating a scan and its metadata.
+    """
+    params: Dict[str, str] = {
+        "xsiType": (scan_meta or {}).get("xsiType", "xnat:mrScanData"),
+        "req_format": "qs",
+    }
+
+    if scan_meta:
+        for key in ("type", "series_description", "quality", "note"):
+            val = _clean_text(scan_meta.get(key))
+            if val:
+                params[key] = val
+
+    return params
+
+
+def update_dest_scan_metadata(
+    xdst: XNAT,
+    dst_expt_id: str,
+    scan_id: str,
+    scan_meta: Optional[Dict[str, str]],
+) -> None:
+    """
+    Update an existing destination scan with preserved metadata.
+    """
+    if not PRESERVE_SCAN_METADATA:
+        return
+    if not scan_meta:
+        return
+    if DRY_RUN or dst_expt_id.startswith("DRYRUN_"):
+        logging.info(f"[DST] would update scan metadata for scan {scan_id}: {scan_meta}")
+        return
+
+    params = build_scan_put_params(scan_meta)
+    logging.info(
+        f"[DST] preserving scan metadata scan={scan_id}"
+        f" type={scan_meta.get('type', '')!r}"
+        f" series_description={scan_meta.get('series_description', '')!r}"
+        f" quality={scan_meta.get('quality', '')!r}"
+    )
+    xdst.put(f"/data/experiments/{dst_expt_id}/scans/{scan_id}", params=params)
+
+
+def reapply_scan_metadata_map(
+    xdst: XNAT,
+    dst_expt_id: str,
+    scan_meta_by_id: Dict[str, Dict[str, str]],
+) -> None:
+    """
+    Re-apply preserved scan metadata for all scans in a session.
+    Useful after pullDataFromHeaders.
+    """
+    if not PRESERVE_SCAN_METADATA:
+        return
+    if not REAPPLY_SCAN_METADATA_AFTER_PULL:
+        return
+
+    for scan_id, scan_meta in scan_meta_by_id.items():
+        try:
+            update_dest_scan_metadata(xdst, dst_expt_id, scan_id, scan_meta)
+        except Exception as e:
+            logging.warning(f"[DST] re-apply scan metadata failed scan={scan_id}: {e}")
+
+
 # -------- Source enumeration --------
 
 def list_source_sessions_for_subject(xsrc: XNAT, subject_label: str) -> List[Dict]:
@@ -459,7 +707,16 @@ def get_session_date(x: XNAT, experiment_id: str) -> Optional[str]:
 
 
 def list_scans_by_expt_id(x: XNAT, experiment_id: str) -> List[Dict]:
-    j = x.get_json(f"/data/experiments/{experiment_id}/scans", params={"format": "json"})
+    """
+    Ask XNAT for scan rows including key scan metadata that we may want to preserve.
+    """
+    j = x.get_json(
+        f"/data/experiments/{experiment_id}/scans",
+        params={
+            "format": "json",
+            "columns": "ID,xsiType,type,series_description,quality,note",
+        },
+    )
     return rs_result_list(j)
 
 
@@ -526,22 +783,34 @@ def ensure_dest_session(xdst: XNAT, subject_label: str, session_label: str, sess
     return new_id or (find_experiment_in_project_by_label(xdst, DST_PROJECT, session_label) or "")
 
 
-def ensure_dest_scan(xdst: XNAT, subject_label: str, session_label: str, dst_expt_id: str, scan_id: str) -> None:
-    if dst_expt_id.startswith("DRYRUN_"):
-        logging.info(f"[DST] would ensure scan {scan_id} exists")
+def ensure_dest_scan(
+    xdst: XNAT,
+    subject_label: str,
+    session_label: str,
+    dst_expt_id: str,
+    scan_id: str,
+    scan_meta: Optional[Dict[str, str]] = None,
+) -> None:
+    dst_scans = []
+    if not dst_expt_id.startswith("DRYRUN_"):
+        dst_scans = list_scans_by_expt_id(xdst, dst_expt_id)
+
+    already_exists = any(str(s.get("ID")) == str(scan_id) for s in dst_scans)
+
+    if already_exists:
+        if PRESERVE_SCAN_METADATA and scan_meta:
+            update_dest_scan_metadata(xdst, dst_expt_id, scan_id, scan_meta)
         return
 
-    dst_scans = list_scans_by_expt_id(xdst, dst_expt_id)
-    if any(str(s.get("ID")) == str(scan_id) for s in dst_scans):
-        return
-
-    if DRY_RUN:
+    if DRY_RUN or dst_expt_id.startswith("DRYRUN_"):
         logging.info(f"[DST] would create scan {scan_id} in {session_label}")
+        if PRESERVE_SCAN_METADATA and scan_meta:
+            logging.info(f"[DST] would set scan metadata for scan {scan_id}: {scan_meta}")
         return
 
     logging.info(f"[DST] creating scan {scan_id} in {session_label}")
     put_path = f"/data/projects/{DST_PROJECT}/subjects/{subject_label}/experiments/{session_label}/scans/{scan_id}"
-    params = {"xsiType": "xnat:mrScanData", "req_format": "qs"}
+    params = build_scan_put_params(scan_meta)
     xdst.put(put_path, params=params)
 
 
@@ -774,14 +1043,21 @@ def run_dicom_phase(xsrc: XNAT, xdst: XNAT) -> None:
                 logging.info(f"[DST] experiment id: {dst_expt_id}")
 
             src_scans = list_scans_by_expt_id(xsrc, src_expt_id)
+            src_scan_meta_by_id: Dict[str, Dict[str, str]] = {}
+            for s in src_scans:
+                sid = _clean_text(s.get("ID"))
+                if sid:
+                    src_scan_meta_by_id[sid] = build_scan_metadata_from_row(s)
 
             for s in src_scans:
                 scan_id = str(s.get("ID"))
                 if not scan_id:
                     continue
 
+                scan_meta = src_scan_meta_by_id.get(scan_id)
+
                 try:
-                    ensure_dest_scan(xdst, subj, sess_label, dst_expt_id, scan_id)
+                    ensure_dest_scan(xdst, subj, sess_label, dst_expt_id, scan_id, scan_meta=scan_meta)
 
                     expected = get_resource_file_count(xsrc, src_expt_id, scan_id, "DICOM")
                     ensure_dest_resource_folder(xdst, dst_expt_id, scan_id, "DICOM", fmt="DICOM", content="RAW")
@@ -789,12 +1065,20 @@ def run_dicom_phase(xsrc: XNAT, xdst: XNAT) -> None:
                     if SKIP_EXISTING and not dst_expt_id.startswith("DRYRUN_"):
                         if get_resource_file_count(xdst, dst_expt_id, scan_id, "DICOM") > 0:
                             logging.info(f"[DST] skip existing DICOM scan={scan_id}")
+                            if PULL_HEADERS_MODE == "scan":
+                                try:
+                                    logging.info(f"[DST] pullDataFromHeaders scan={scan_id}")
+                                    pull_headers_scan(xdst, dst_expt_id, scan_id)
+                                    if REAPPLY_SCAN_METADATA_AFTER_PULL:
+                                        update_dest_scan_metadata(xdst, dst_expt_id, scan_id, scan_meta)
+                                except Exception as e:
+                                    logging.warning(f"[DST] pullDataFromHeaders scan={scan_id} failed: {e}")
                             continue
 
                     zip_path = STAGING_DIR / f"SRC_{SRC_PROJECT}_{subj}_{sess_label}_scan{scan_id}_DICOM.zip"
 
                     download_resource_zip_with_retry(xsrc, src_expt_id, scan_id, "DICOM", zip_path)
-                    zip_path_use = maybe_normalize_zip(zip_path, "DICOM")  # usually skipped
+                    zip_path_use = maybe_normalize_zip(zip_path, "DICOM")
                     upload_resource_zip_extract_resilient(xdst, dst_expt_id, scan_id, "DICOM", zip_path_use)
 
                     if REFRESH_CATALOG_AFTER_UPLOAD and not dst_expt_id.startswith("DRYRUN_"):
@@ -817,6 +1101,8 @@ def run_dicom_phase(xsrc: XNAT, xdst: XNAT) -> None:
                             try:
                                 logging.info(f"[DST] pullDataFromHeaders scan={scan_id} (attempt {attempt})")
                                 pull_headers_scan(xdst, dst_expt_id, scan_id)
+                                if REAPPLY_SCAN_METADATA_AFTER_PULL:
+                                    update_dest_scan_metadata(xdst, dst_expt_id, scan_id, scan_meta)
                                 break
                             except Exception as e:
                                 logging.warning(f"[DST] pullDataFromHeaders scan={scan_id} failed: {e}")
@@ -830,6 +1116,8 @@ def run_dicom_phase(xsrc: XNAT, xdst: XNAT) -> None:
                 try:
                     logging.info(f"[DST] pullDataFromHeaders session={dst_expt_id}")
                     pull_headers_session(xdst, dst_expt_id)
+                    if REAPPLY_SCAN_METADATA_AFTER_PULL:
+                        reapply_scan_metadata_map(xdst, dst_expt_id, src_scan_meta_by_id)
                 except Exception as e:
                     logging.warning(f"[DST] pullDataFromHeaders session failed: {e}")
 
@@ -854,14 +1142,21 @@ def run_resources_phase(xsrc: XNAT, xdst: XNAT) -> None:
                 continue
 
             src_scans = list_scans_by_expt_id(xsrc, src_expt_id)
+            src_scan_meta_by_id: Dict[str, Dict[str, str]] = {}
+            for s in src_scans:
+                sid = _clean_text(s.get("ID"))
+                if sid:
+                    src_scan_meta_by_id[sid] = build_scan_metadata_from_row(s)
 
             for s in src_scans:
                 scan_id = str(s.get("ID"))
                 if not scan_id:
                     continue
 
+                scan_meta = src_scan_meta_by_id.get(scan_id)
+
                 try:
-                    ensure_dest_scan(xdst, subj, sess_label, dst_expt_id, scan_id)
+                    ensure_dest_scan(xdst, subj, sess_label, dst_expt_id, scan_id, scan_meta=scan_meta)
 
                     src_resources = list_scan_resources(xsrc, src_expt_id, scan_id)
                     for r in src_resources:
@@ -889,7 +1184,6 @@ def run_resources_phase(xsrc: XNAT, xdst: XNAT) -> None:
 
                         download_resource_zip_with_retry(xsrc, src_expt_id, scan_id, label, zip_path)
 
-                        # Normalise (now also writes entries alphabetically)
                         zip_path_use = maybe_normalize_zip(zip_path, label)
 
                         upload_resource_zip_extract_resilient(xdst, dst_expt_id, scan_id, label, zip_path_use)
@@ -906,18 +1200,43 @@ def run_resources_phase(xsrc: XNAT, xdst: XNAT) -> None:
 def main() -> int:
     setup_logging()
 
-    if PHASE not in {"dicom", "resources"}:
-        logging.error("PHASE must be 'dicom' or 'resources'")
+    try:
+        validate_runtime_config()
+        source_side, dest_side = resolve_direction()
+    except Exception as e:
+        logging.error(str(e))
         return 2
 
     logging.info(
-        f"PHASE={PHASE} | DRY_RUN={DRY_RUN} | SKIP_EXISTING={SKIP_EXISTING} | PULL_HEADERS_MODE={PULL_HEADERS_MODE} "
-        f"| NORMALIZE_ZIPS={NORMALIZE_DOWNLOADED_ZIPS} | SORT_ZIP_ALPHA={SORT_ZIP_ENTRIES_ALPHABETICAL}"
+        f"DIRECTION={DIRECTION!r} -> source={source_side} destination={dest_side}"
+    )
+
+    logging.info(
+        f"PHASE={PHASE} | DRY_RUN={DRY_RUN} | SKIP_EXISTING={SKIP_EXISTING} | "
+        f"PULL_HEADERS_MODE={PULL_HEADERS_MODE} | PRESERVE_SCAN_METADATA={PRESERVE_SCAN_METADATA} | "
+        f"REAPPLY_AFTER_PULL={REAPPLY_SCAN_METADATA_AFTER_PULL} | "
+        f"NORMALIZE_ZIPS={NORMALIZE_DOWNLOADED_ZIPS} | SORT_ZIP_ALPHA={SORT_ZIP_ENTRIES_ALPHABETICAL}"
     )
     logging.info(f"SRC={SRC_BASE_URL} project={SRC_PROJECT} | DST={DST_BASE_URL} project={DST_PROJECT}")
 
-    xsrc = XNAT(SRC_BASE_URL, SRC_USER, SRC_PASS, verify_tls=VERIFY_TLS)
-    xdst = XNAT(DST_BASE_URL, DST_USER, DST_PASS, verify_tls=VERIFY_TLS)
+    try:
+        src_user, src_pass = prompt_credentials(
+            endpoint_label=f"source ({SOURCE_SIDE_NAME})",
+            base_url=SRC_BASE_URL,
+        )
+        dst_user, dst_pass = prompt_credentials(
+            endpoint_label=f"destination ({DEST_SIDE_NAME})",
+            base_url=DST_BASE_URL,
+        )
+    except CredentialPromptCancelled as e:
+        logging.error(str(e))
+        return 1
+    except Exception as e:
+        logging.exception(f"[AUTH] failed to obtain credentials: {e}")
+        return 1
+
+    xsrc = XNAT(SRC_BASE_URL, src_user, src_pass, verify_tls=VERIFY_TLS)
+    xdst = XNAT(DST_BASE_URL, dst_user, dst_pass, verify_tls=VERIFY_TLS)
 
     try:
         if PHASE == "dicom":

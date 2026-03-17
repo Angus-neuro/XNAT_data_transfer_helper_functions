@@ -11,10 +11,14 @@ using REST:
   4) (Optional) refresh catalog and wait for expected file_count
   5) (Optional) delete the source resource (i.e., "rename" behaviour)
 
+Credentials
+-----------
+- Username and password are prompted at runtime via pop-up windows.
 """
 
 from __future__ import annotations
 
+import getpass
 import logging
 import shutil
 import time
@@ -30,9 +34,6 @@ import requests
 
 BASE_URL = ""
 PROJECT = ""
-
-USER = ""
-PASS = ""
 
 # Which subjects to process (subject labels)
 SUBJECT_LABELS = [""]
@@ -131,6 +132,83 @@ RETRYABLE_ERROR_SUBSTRINGS = (
 # =========================
 
 
+class CredentialPromptCancelled(Exception):
+    """Raised when the user cancels credential entry."""
+
+
+def _prompt_credentials_gui(base_url: str) -> Tuple[str, str]:
+    """
+    Prompt for username/password using pop-up windows.
+    """
+    import tkinter as tk
+    from tkinter import messagebox, simpledialog
+
+    root = tk.Tk()
+    root.withdraw()
+
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    try:
+        while True:
+            user = simpledialog.askstring(
+                title="XNAT Login",
+                prompt=f"Enter username for:\n{base_url}",
+                parent=root,
+            )
+            if user is None:
+                raise CredentialPromptCancelled("Credential entry cancelled.")
+            user = user.strip()
+            if user:
+                break
+            messagebox.showerror("Missing username", "Username cannot be empty.", parent=root)
+
+        while True:
+            password = simpledialog.askstring(
+                title="XNAT Login",
+                prompt=f"Enter password for:\n{base_url}",
+                parent=root,
+                show="*",
+            )
+            if password is None:
+                raise CredentialPromptCancelled("Credential entry cancelled.")
+            if password:
+                break
+            messagebox.showerror("Missing password", "Password cannot be empty.", parent=root)
+
+        return user, password
+
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def prompt_credentials(base_url: str) -> Tuple[str, str]:
+    """
+    Ask for credentials. Uses a GUI popup when available, with a terminal fallback.
+    """
+    try:
+        return _prompt_credentials_gui(base_url)
+    except CredentialPromptCancelled:
+        raise
+    except Exception as e:
+        logging.warning(f"[AUTH] GUI credential prompt unavailable: {e}. Falling back to terminal input.")
+
+        user = input(f"Enter username for {base_url}: ").strip()
+        if not user:
+            raise CredentialPromptCancelled("Username entry cancelled/empty.")
+
+        password = getpass.getpass(f"Enter password for {base_url}: ").strip()
+        if not password:
+            raise CredentialPromptCancelled("Password entry cancelled/empty.")
+
+        return user, password
+
+
 def setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -180,7 +258,7 @@ def _strip_prefix_to_resource_files(member_path: str, resource_label: str) -> Op
     idx = p.find(marker)
     if idx < 0:
         return None
-    return p[idx + len(marker) :]
+    return p[idx + len(marker):]
 
 
 def normalize_zip_to_resource_files_root(zip_in: Path, resource_label: str) -> Tuple[Path, int]:
@@ -197,7 +275,6 @@ def normalize_zip_to_resource_files_root(zip_in: Path, resource_label: str) -> T
 
     zip_out = zip_in.with_name(zip_in.stem + "__normalized.zip")
 
-    # Build list of (final_name, info, was_rewritten)
     entries: List[Tuple[str, zipfile.ZipInfo, bool]] = []
     with zipfile.ZipFile(zip_in, "r") as zin:
         for info in zin.infolist():
@@ -224,7 +301,6 @@ def normalize_zip_to_resource_files_root(zip_in: Path, resource_label: str) -> T
 
         with zipfile.ZipFile(zip_out, "w", compression=zipfile.ZIP_DEFLATED) as zout:
             for base_name, info, _ in entries:
-                # ensure uniqueness (rare but possible)
                 c = name_counts.get(base_name, 0) + 1
                 name_counts[base_name] = c
                 final_name = base_name if c == 1 else f"{base_name}__dup{c}"
@@ -243,7 +319,6 @@ def normalize_zip_to_resource_files_root(zip_in: Path, resource_label: str) -> T
             pass
         raise RuntimeError(f"Normalised zip failed validation: {zip_out}")
 
-    # If nothing changed, keep original zip
     if rewritten == 0:
         try:
             zip_out.unlink()
@@ -674,7 +749,6 @@ def copy_resource_for_scan(
 
     download_resource_zip_with_retry(x, experiment_id, scan_id, src_res, zip_path)
 
-    # Normalise (also writes entries in alphabetical order if enabled)
     zip_path_use = maybe_normalize_zip(zip_path, src_res)
 
     upload_zip_extract_resilient(x, experiment_id, scan_id, dst_res, zip_path_use)
@@ -710,9 +784,7 @@ def copy_resource_for_scan(
             logging.warning(f"[DELETE] failed to delete source resource scan={scan_id} res={src_res}: {e}")
 
 
-def run() -> None:
-    x = XNAT(BASE_URL, USER, PASS, verify_tls=VERIFY_TLS)
-
+def run(x: XNAT) -> None:
     for subj in SUBJECT_LABELS:
         logging.info(f"=== SUBJECT {subj} ===")
 
@@ -765,7 +837,18 @@ def main() -> int:
     logging.info(f"RESOURCE_COPIES={RESOURCE_COPIES}")
 
     try:
-        run()
+        user, password = prompt_credentials(BASE_URL)
+    except CredentialPromptCancelled as e:
+        logging.error(str(e))
+        return 1
+    except Exception as e:
+        logging.exception(f"[AUTH] failed to obtain credentials: {e}")
+        return 1
+
+    x = XNAT(BASE_URL, user, password, verify_tls=VERIFY_TLS)
+
+    try:
+        run(x)
     except Exception as e:
         logging.exception(str(e))
         return 1

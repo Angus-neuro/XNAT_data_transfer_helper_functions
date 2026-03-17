@@ -15,10 +15,14 @@ Rules:
 - If exactly 1 match: download that file, upload to destination resource,
   then optionally delete it from source (controlled by DELETE_SOURCE_AFTER_UPLOAD).
 
+Credentials
+-----------
+- Username and password are prompted at runtime via pop-up windows.
 """
 
 from __future__ import annotations
 
+import getpass
 import logging
 import time
 from pathlib import Path, PurePosixPath
@@ -41,18 +45,15 @@ except Exception:
 BASE_URL = ""
 PROJECT = ""
 
-USER = ""
-PASS = ""
-
 # Identify the data scope
 SUBJECT_LABEL = ""
 SESSION_LABEL = ""   # session label inside the project (MR session)
 
 # Source and destination
-SRC_SCAN_ID = "17"
+SRC_SCAN_ID = ""
 SRC_RESOURCE_LABEL = ""
 
-DST_SCAN_ID = "17"
+DST_SCAN_ID = ""
 DST_RESOURCE_LABEL = ""
 
 # --- Targeting ---
@@ -81,7 +82,7 @@ SKIP_IF_DST_FILE_EXISTS = True
 # Only used when SKIP_IF_DST_FILE_EXISTS is False.
 OVERWRITE_DST_FILE = False
 
-# NEW: If True, delete source file after successful upload (move behaviour).
+# If True, delete source file after successful upload (move behaviour).
 # If False, keep source file (copy-only behaviour).
 DELETE_SOURCE_AFTER_UPLOAD = False
 
@@ -123,12 +124,91 @@ RETRYABLE_ERROR_SUBSTRINGS = (
 # =========================
 
 
+class CredentialPromptCancelled(Exception):
+    """Raised when the user cancels credential entry."""
+
+
 def setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def _prompt_credentials_gui(base_url: str) -> Tuple[str, str]:
+    """
+    Prompt for username/password using pop-up windows.
+    """
+    import tkinter as tk
+    from tkinter import messagebox, simpledialog
+
+    root = tk.Tk()
+    root.withdraw()
+
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    try:
+        while True:
+            user = simpledialog.askstring(
+                title="XNAT Login",
+                prompt=f"Enter username for:\n{base_url}",
+                parent=root,
+            )
+            if user is None:
+                raise CredentialPromptCancelled("Credential entry cancelled.")
+            user = user.strip()
+            if user:
+                break
+            messagebox.showerror("Missing username", "Username cannot be empty.", parent=root)
+
+        while True:
+            password = simpledialog.askstring(
+                title="XNAT Login",
+                prompt=f"Enter password for:\n{base_url}",
+                parent=root,
+                show="*",
+            )
+            if password is None:
+                raise CredentialPromptCancelled("Credential entry cancelled.")
+            if password:
+                break
+            messagebox.showerror("Missing password", "Password cannot be empty.", parent=root)
+
+        return user, password
+
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def prompt_credentials(base_url: str) -> Tuple[str, str]:
+    """
+    Ask for credentials. Uses a GUI popup when available, with a terminal fallback.
+    """
+    try:
+        return _prompt_credentials_gui(base_url)
+    except CredentialPromptCancelled:
+        raise
+    except Exception as e:
+        logging.warning(
+            f"[AUTH] GUI credential prompt unavailable: {e}. Falling back to terminal input."
+        )
+
+        user = input(f"Enter username for {base_url}: ").strip()
+        if not user:
+            raise CredentialPromptCancelled("Username entry cancelled/empty.")
+
+        password = getpass.getpass(f"Enter password for {base_url}: ").strip()
+        if not password:
+            raise CredentialPromptCancelled("Password entry cancelled/empty.")
+
+        return user, password
 
 
 def _sleep_backoff(attempt: int) -> None:
@@ -270,7 +350,6 @@ class XNAT:
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"PUT(file) {path} failed (request exception): {e}") from e
         finally:
-            # Ensure the bar isn't left open on unexpected errors
             try:
                 if "pbar" in locals() and pbar is not None:
                     pbar.close()
@@ -745,7 +824,16 @@ def main() -> int:
     logging.info(f"XNAT={BASE_URL} project={PROJECT} subject={SUBJECT_LABEL} session={SESSION_LABEL}")
     logging.info(f"SRC scan={SRC_SCAN_ID} res={SRC_RESOURCE_LABEL} -> DST scan={DST_SCAN_ID} res={DST_RESOURCE_LABEL}")
 
-    x = XNAT(BASE_URL, USER, PASS, verify_tls=VERIFY_TLS)
+    try:
+        user, password = prompt_credentials(BASE_URL)
+    except CredentialPromptCancelled as e:
+        logging.error(str(e))
+        return 1
+    except Exception as e:
+        logging.exception(f"[AUTH] failed to obtain credentials: {e}")
+        return 1
+
+    x = XNAT(BASE_URL, user, password, verify_tls=VERIFY_TLS)
 
     expt_id = find_experiment_id_by_label(x, PROJECT, SESSION_LABEL)
     if not expt_id:

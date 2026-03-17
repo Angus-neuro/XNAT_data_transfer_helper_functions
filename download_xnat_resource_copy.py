@@ -4,9 +4,9 @@ download_xnat_resource.py
 
 Download ONE specific XNAT resource (subject / experiment / scan level) to a local folder.
 
-Usage 
+Usage
 ---------------
-1) Edit USER CONFIG below 
+1) Edit USER CONFIG below
 2) Run:
    python download_xnat_resource.py
 
@@ -14,6 +14,10 @@ Notes
 -----
 - For experiment-level / scan-level resources: XNAT experiment ID is used under /data/experiments/{ID}/...
 - The script enforces UNIQUE matches for experiment/scan/resource when using substring matching.
+
+Credentials
+-----------
+- Username and password are prompted at runtime via pop-up windows.
 
 Requires:
   pip install requests
@@ -24,11 +28,10 @@ Optional:
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
-import os
 import re
 import shutil
-import sys
 import time
 import zipfile
 from pathlib import Path
@@ -46,9 +49,6 @@ except Exception:
 # =========================
 # USER CONFIG (edit these)
 # =========================
-
-USERNAME = os.environ.get("XNAT_USER", "")
-PASSWORD = os.environ.get("XNAT_PASS", "")
 
 BASE_URL = ""
 
@@ -86,6 +86,86 @@ ONLY_MR_SESSIONS = True
 # =========================
 # END USER CONFIG
 # =========================
+
+
+class CredentialPromptCancelled(Exception):
+    """Raised when the user cancels credential entry."""
+
+
+# -------------------------
+# credential prompt helpers
+# -------------------------
+def _prompt_credentials_gui(base_url: str) -> Tuple[str, str]:
+    """
+    Prompt for username/password using pop-up windows.
+    """
+    import tkinter as tk
+    from tkinter import messagebox, simpledialog
+
+    root = tk.Tk()
+    root.withdraw()
+
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    try:
+        while True:
+            username = simpledialog.askstring(
+                title="XNAT Login",
+                prompt=f"Enter username for:\n{base_url}",
+                parent=root,
+            )
+            if username is None:
+                raise CredentialPromptCancelled("Credential entry cancelled.")
+            username = username.strip()
+            if username:
+                break
+            messagebox.showerror("Missing username", "Username cannot be empty.", parent=root)
+
+        while True:
+            password = simpledialog.askstring(
+                title="XNAT Login",
+                prompt=f"Enter password for:\n{base_url}",
+                parent=root,
+                show="*",
+            )
+            if password is None:
+                raise CredentialPromptCancelled("Credential entry cancelled.")
+            if password:
+                break
+            messagebox.showerror("Missing password", "Password cannot be empty.", parent=root)
+
+        return username, password
+
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def prompt_credentials(base_url: str) -> Tuple[str, str]:
+    """
+    Ask for credentials. Uses a GUI popup when available, with a terminal fallback.
+    """
+    try:
+        return _prompt_credentials_gui(base_url)
+    except CredentialPromptCancelled:
+        raise
+    except Exception as e:
+        print(f"[AUTH] GUI credential prompt unavailable: {e}. Falling back to terminal input.")
+
+        username = input(f"Enter username for {base_url}: ").strip()
+        if not username:
+            raise CredentialPromptCancelled("Username entry cancelled/empty.")
+
+        password = getpass.getpass(f"Enter password for {base_url}: ").strip()
+        if not password:
+            raise CredentialPromptCancelled("Password entry cancelled/empty.")
+
+        return username, password
 
 
 # -------------------------
@@ -373,7 +453,7 @@ def _extract_xnat_zip_flat(zip_path: Path, dest_dir: Path) -> None:
 
             cut = low.rfind("/files/")
             if cut != -1:
-                rel_posix = name[cut + len("/files/") :]
+                rel_posix = name[cut + len("/files/"):]
             else:
                 rel_posix = name.split("/")[-1]
 
@@ -542,7 +622,7 @@ def main() -> int:
 
     verify_ssl = VERIFY_SSL and (not args.insecure)
 
-    # Prompt for subject if missing (as requested)
+    # Prompt for subject/session/scan if missing
     try:
         if not project:
             project = _prompt_if_missing("PROJECT_ID", project)
@@ -559,8 +639,14 @@ def main() -> int:
     if not (resource_label or resource_match):
         print("ERROR: Set RESOURCE_LABEL or RESOURCE_MATCH (or CLI --resource/--resource-match).")
         return 2
-    if not USERNAME or not PASSWORD:
-        print("ERROR: Missing credentials. Set env vars XNAT_USER and XNAT_PASS (or edit config).")
+
+    try:
+        username, password = prompt_credentials(base_url)
+    except CredentialPromptCancelled as e:
+        print(f"ERROR: {e}")
+        return 2
+    except Exception as e:
+        print(f"ERROR: failed to obtain credentials: {e}")
         return 2
 
     print("XNAT targeted scan-resource download")
@@ -572,7 +658,7 @@ def main() -> int:
     print()
 
     xnat = requests.Session()
-    xnat.auth = HTTPBasicAuth(USERNAME, PASSWORD)
+    xnat.auth = HTTPBasicAuth(username, password)
     xnat.verify = verify_ssl
 
     # Auth sanity check

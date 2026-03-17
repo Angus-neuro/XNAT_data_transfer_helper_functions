@@ -8,10 +8,14 @@ WITHIN THE SAME MR SESSION (experiment), WITHOUT deleting the original.
 Example:
   Copy scan 21 / resource NIFTI  ->  scan 15 / resource NIFTI
 
+Credentials
+-----------
+- Username and password are prompted at runtime via pop-up windows.
 """
 
 from __future__ import annotations
 
+import getpass
 import logging
 import shutil
 import time
@@ -29,18 +33,15 @@ import requests
 BASE_URL = ""
 PROJECT = ""
 
-USER = ""
-PASS = ""
-
 # Identify the data scope
 SUBJECT_LABEL = ""
 SESSION_LABEL = ""   # session label inside the project (MR session)
 
 # Source and destination
-SRC_SCAN_ID = "15"
+SRC_SCAN_ID = ""
 SRC_RESOURCE_LABEL = "NIFTI"
 
-DST_SCAN_ID = "9"
+DST_SCAN_ID = ""
 DST_RESOURCE_LABEL = "NIFTI"
 
 STAGING_DIR = Path(r"")
@@ -115,12 +116,91 @@ RETRYABLE_ERROR_SUBSTRINGS = (
 # =========================
 
 
+class CredentialPromptCancelled(Exception):
+    """Raised when the user cancels credential entry."""
+
+
 def setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def _prompt_credentials_gui(base_url: str) -> Tuple[str, str]:
+    """
+    Prompt for username/password using pop-up windows.
+    """
+    import tkinter as tk
+    from tkinter import messagebox, simpledialog
+
+    root = tk.Tk()
+    root.withdraw()
+
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    try:
+        while True:
+            user = simpledialog.askstring(
+                title="XNAT Login",
+                prompt=f"Enter username for:\n{base_url}",
+                parent=root,
+            )
+            if user is None:
+                raise CredentialPromptCancelled("Credential entry cancelled.")
+            user = user.strip()
+            if user:
+                break
+            messagebox.showerror("Missing username", "Username cannot be empty.", parent=root)
+
+        while True:
+            password = simpledialog.askstring(
+                title="XNAT Login",
+                prompt=f"Enter password for:\n{base_url}",
+                parent=root,
+                show="*",
+            )
+            if password is None:
+                raise CredentialPromptCancelled("Credential entry cancelled.")
+            if password:
+                break
+            messagebox.showerror("Missing password", "Password cannot be empty.", parent=root)
+
+        return user, password
+
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def prompt_credentials(base_url: str) -> Tuple[str, str]:
+    """
+    Ask for credentials. Uses a GUI popup when available, with a terminal fallback.
+    """
+    try:
+        return _prompt_credentials_gui(base_url)
+    except CredentialPromptCancelled:
+        raise
+    except Exception as e:
+        logging.warning(
+            f"[AUTH] GUI credential prompt unavailable: {e}. Falling back to terminal input."
+        )
+
+        user = input(f"Enter username for {base_url}: ").strip()
+        if not user:
+            raise CredentialPromptCancelled("Username entry cancelled/empty.")
+
+        password = getpass.getpass(f"Enter password for {base_url}: ").strip()
+        if not password:
+            raise CredentialPromptCancelled("Password entry cancelled/empty.")
+
+        return user, password
 
 
 def _sleep_backoff(attempt: int) -> None:
@@ -221,7 +301,6 @@ def normalize_zip_paths(zip_in: Path, zip_out: Path, mode: str) -> Tuple[Path, i
                 used_names[new_name] = 0
 
             with zin.open(info, "r") as src:
-                # Stream into the new zip
                 with zout.open(new_name, "w") as dst:
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
 
@@ -483,7 +562,6 @@ def ensure_resource_folder(
             params=params if params else None,
         )
     except RuntimeError as e:
-        # If it raced and now exists, treat 409 as OK
         if " 409 " in str(e) or "Specified resource already exists" in str(e):
             return
         raise
@@ -631,7 +709,7 @@ def copy_between_scans(
         logging.info(f"[DST] clearing destination resource: scan={dst_scan} res={dst_res}")
         x.delete(f"/data/experiments/{experiment_id}/scans/{dst_scan}/resources/{dst_res}")
 
-    # Create destination resource folder if missing (no 409 failure)
+    # Create destination resource folder if missing
     fmt = src_meta.get("format") or None
     content = src_meta.get("content") or None
     ensure_resource_folder(x, experiment_id, dst_scan, dst_res, fmt=fmt, content=content)
@@ -685,7 +763,16 @@ def main() -> int:
     logging.info(f"XNAT={BASE_URL} project={PROJECT} subject={SUBJECT_LABEL} session={SESSION_LABEL}")
     logging.info(f"SRC scan={SRC_SCAN_ID} res={SRC_RESOURCE_LABEL} -> DST scan={DST_SCAN_ID} res={DST_RESOURCE_LABEL}")
 
-    x = XNAT(BASE_URL, USER, PASS, verify_tls=VERIFY_TLS)
+    try:
+        user, password = prompt_credentials(BASE_URL)
+    except CredentialPromptCancelled as e:
+        logging.error(str(e))
+        return 1
+    except Exception as e:
+        logging.exception(f"[AUTH] failed to obtain credentials: {e}")
+        return 1
+
+    x = XNAT(BASE_URL, user, password, verify_tls=VERIFY_TLS)
 
     expt_id = find_experiment_id_by_label(x, PROJECT, SESSION_LABEL)
     if not expt_id:

@@ -3,21 +3,24 @@
 download_xnat_subject_data.py
 
 Download available data for a given SUBJECT_ID (within a PROJECT_ID) from XNAT
-to a local directory. 
+to a local directory.
 
   - Downloading each resource as a ZIP then optionally extract.
   - If ZIP download fails, fall back to downloading files one-by-one.
+
+Credentials
+-----------
+- Username and password are prompted at runtime via pop-up windows.
 
 Requires:
   pip install requests
 Optional (for nicer retries):
   pip install urllib3
-
 """
 
 from __future__ import annotations
 
-import os
+import getpass
 import re
 import json
 import time
@@ -32,9 +35,6 @@ from requests.auth import HTTPBasicAuth
 # =========================
 # USER CONFIG (edit these)
 # =========================
-
-USERNAME = os.environ.get("XNAT_USER", "")
-PASSWORD = os.environ.get("XNAT_PASS", "")
 
 BASE_URL = ""
 PROJECT_ID = ""
@@ -71,6 +71,86 @@ RETRY_BACKOFF_SECONDS = 2
 # =========================
 # END USER CONFIG
 # =========================
+
+
+class CredentialPromptCancelled(Exception):
+    """Raised when the user cancels credential entry."""
+
+
+# -------------------------
+# credential prompt helpers
+# -------------------------
+def _prompt_credentials_gui(base_url: str) -> Tuple[str, str]:
+    """
+    Prompt for username/password using pop-up windows.
+    """
+    import tkinter as tk
+    from tkinter import messagebox, simpledialog
+
+    root = tk.Tk()
+    root.withdraw()
+
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    try:
+        while True:
+            username = simpledialog.askstring(
+                title="XNAT Login",
+                prompt=f"Enter username for:\n{base_url}",
+                parent=root,
+            )
+            if username is None:
+                raise CredentialPromptCancelled("Credential entry cancelled.")
+            username = username.strip()
+            if username:
+                break
+            messagebox.showerror("Missing username", "Username cannot be empty.", parent=root)
+
+        while True:
+            password = simpledialog.askstring(
+                title="XNAT Login",
+                prompt=f"Enter password for:\n{base_url}",
+                parent=root,
+                show="*",
+            )
+            if password is None:
+                raise CredentialPromptCancelled("Credential entry cancelled.")
+            if password:
+                break
+            messagebox.showerror("Missing password", "Password cannot be empty.", parent=root)
+
+        return username, password
+
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def prompt_credentials(base_url: str) -> Tuple[str, str]:
+    """
+    Ask for credentials. Uses a GUI popup when available, with a terminal fallback.
+    """
+    try:
+        return _prompt_credentials_gui(base_url)
+    except CredentialPromptCancelled:
+        raise
+    except Exception as e:
+        print(f"[AUTH] GUI credential prompt unavailable: {e}. Falling back to terminal input.")
+
+        username = input(f"Enter username for {base_url}: ").strip()
+        if not username:
+            raise CredentialPromptCancelled("Username entry cancelled/empty.")
+
+        password = getpass.getpass(f"Enter password for {base_url}: ").strip()
+        if not password:
+            raise CredentialPromptCancelled("Password entry cancelled/empty.")
+
+        return username, password
 
 
 # -------------------------
@@ -399,6 +479,19 @@ def download_resource(
 
 
 def main() -> int:
+    if not BASE_URL or not PROJECT_ID or not SUBJECT_ID:
+        print("ERROR: BASE_URL, PROJECT_ID, and SUBJECT_ID must be set in USER CONFIG.")
+        return 2
+
+    try:
+        username, password = prompt_credentials(BASE_URL)
+    except CredentialPromptCancelled as e:
+        print(f"ERROR: {e}")
+        return 2
+    except Exception as e:
+        print(f"ERROR: failed to obtain credentials: {e}")
+        return 2
+
     out_subject_root = OUTPUT_ROOT / f"{_safe_name(PROJECT_ID)}__{_safe_name(SUBJECT_ID)}"
     out_subject_root.mkdir(parents=True, exist_ok=True)
 
@@ -411,7 +504,7 @@ def main() -> int:
     print()
 
     xnat = requests.Session()
-    xnat.auth = HTTPBasicAuth(USERNAME, PASSWORD)
+    xnat.auth = HTTPBasicAuth(username, password)
     xnat.verify = VERIFY_SSL
 
     # Auth sanity check
