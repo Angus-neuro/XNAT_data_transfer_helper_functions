@@ -1220,13 +1220,15 @@ def main() -> int:
     logging.info(f"SRC={SRC_BASE_URL} project={SRC_PROJECT} | DST={DST_BASE_URL} project={DST_PROJECT}")
 
     try:
-        src_user, src_pass = prompt_credentials(
-            endpoint_label=f"source ({SOURCE_SIDE_NAME})",
-            base_url=SRC_BASE_URL,
+        # Always prompt in fixed endpoint order: A first, then B.
+        # This avoids any confusion when DIRECTION="backwards".
+        a_user, a_pass = prompt_credentials(
+            endpoint_label="endpoint A",
+            base_url=A_BASE_URL,
         )
-        dst_user, dst_pass = prompt_credentials(
-            endpoint_label=f"destination ({DEST_SIDE_NAME})",
-            base_url=DST_BASE_URL,
+        b_user, b_pass = prompt_credentials(
+            endpoint_label="endpoint B",
+            base_url=B_BASE_URL,
         )
     except CredentialPromptCancelled as e:
         logging.error(str(e))
@@ -1235,8 +1237,26 @@ def main() -> int:
         logging.exception(f"[AUTH] failed to obtain credentials: {e}")
         return 1
 
-    xsrc = XNAT(SRC_BASE_URL, src_user, src_pass, verify_tls=VERIFY_TLS)
-    xdst = XNAT(DST_BASE_URL, dst_user, dst_pass, verify_tls=VERIFY_TLS)
+    # Build fixed endpoint clients first.
+    x_a = XNAT(A_BASE_URL, a_user, a_pass, verify_tls=VERIFY_TLS)
+    x_b = XNAT(B_BASE_URL, b_user, b_pass, verify_tls=VERIFY_TLS)
+
+    # Then map them to active source/destination according to DIRECTION.
+    if SOURCE_SIDE_NAME == "A":
+        xsrc = x_a
+        xdst = x_b
+    elif SOURCE_SIDE_NAME == "B":
+        xsrc = x_b
+        xdst = x_a
+    else:
+        logging.error(f"Unexpected SOURCE_SIDE_NAME={SOURCE_SIDE_NAME!r}")
+        return 2
+
+    logging.info(
+        f"[AUTH] credential mapping applied: "
+        f"A->{A_BASE_URL} | B->{B_BASE_URL} | "
+        f"active source={SOURCE_SIDE_NAME} active destination={DEST_SIDE_NAME}"
+    )
 
     try:
         if PHASE == "dicom":
