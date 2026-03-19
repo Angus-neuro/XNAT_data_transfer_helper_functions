@@ -21,8 +21,8 @@ from pydicom.errors import InvalidDicomError
 INPUT_DIR = r""          
 OUTPUT_DIR = r""  
 
-MOVE_FILES = True        # True = move files; False = copy files
-DRY_RUN = False          # True = show what would happen, but do not move/copy
+MOVE_FILES = False        # True = move files; False = copy files
+DRY_RUN = True          # True = show what would happen, but do not move/copy
 RECURSIVE = True         # True = include subfolders inside INPUT_DIR
 PREFIX_WITH_SERIES_NUMBER = True  # Helps disambiguate folders if names repeat
 
@@ -90,8 +90,11 @@ def is_under(path: str, maybe_parent: str) -> bool:
 def iter_files(root: str, recursive: bool = True):
     """
     Yield file paths from root (optionally recursive).
+    Skip OUTPUT_DIR only if it is inside INPUT_DIR.
     """
     root = os.path.abspath(root)
+    output_abs = os.path.abspath(OUTPUT_DIR)
+
     if not recursive:
         for fn in os.listdir(root):
             fp = os.path.join(root, fn)
@@ -100,14 +103,16 @@ def iter_files(root: str, recursive: bool = True):
         return
 
     for dirpath, dirnames, filenames in os.walk(root):
-        # Skip OUTPUT_DIR if it lives inside INPUT_DIR (prevents loops)
-        if is_under(dirpath, OUTPUT_DIR):
+        dirpath_abs = os.path.abspath(dirpath)
+
+        # Only skip the output tree if OUTPUT_DIR is inside the input tree
+        # and we have actually walked into OUTPUT_DIR or one of its children.
+        if is_under(output_abs, root) and is_under(dirpath_abs, output_abs):
             dirnames[:] = []
             continue
 
         for fn in filenames:
             yield os.path.join(dirpath, fn)
-
 
 def get_scan_folder_name(ds) -> str:
     """
