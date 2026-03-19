@@ -59,7 +59,7 @@ SESSION_LABEL_REGEX = None  # e.g. r"^\d{3}_MR_\d+$", r"^[A-Za-z0-9]+_MR_\d+$"
 
 STAGING_DIR = Path(r"D:\Downloads\XNAT_transfer_staging")
 
-PHASE = "resources"   # "dicom" or "resources"
+PHASE = "dicom"   # "dicom" or "resources"
 DRY_RUN = False       # True = no PUT/POST, only GET + plan
 
 # In resources phase, skip these resource labels
@@ -99,7 +99,7 @@ TIMEOUT = 1800  # seconds
 # If True, repackage downloaded zips so extracted files land correctly at destination.
 NORMALIZE_DOWNLOADED_ZIPS = True
 # Skip normalisation for these resources (DICOM often huge and usually fine to keep as-is)
-NORMALIZE_SKIP_RESOURCE_LABELS = {"DICOM"}
+NORMALIZE_SKIP_RESOURCE_LABELS = set()
 # Delete the original downloaded zip after normalisation (saves disk)
 DELETE_ORIGINAL_ZIP_AFTER_NORMALIZE = True
 
