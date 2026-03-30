@@ -17,6 +17,10 @@ New features
 2) Direction control:
       DIRECTION = "forwards"   -> A acts as source, B acts as destination
       DIRECTION = "backwards"  -> B acts as source, A acts as destination
+3) Transfer restriction controls:
+      - MR_SESSION_ID must be set, so the script only processes one MR session
+      - SCAN_IDS can optionally be set to only transfer specific scans within
+        that MR session
 """
 
 from __future__ import annotations
@@ -53,6 +57,15 @@ DIRECTION = "forwards"
 
 # Subjects to transfer (labels)
 SUBJECT_LABELS = [""]
+
+# Exact source MR session / experiment ID to transfer.
+# REQUIRED so the script does not sweep multiple MR sessions at once.
+MR_SESSION_ID = ""   # e.g. "XNAT_E00123"
+
+# Optional: only process these scan IDs within MR_SESSION_ID.
+# Leave empty [] to process all scans in that one MR session.
+# These can be integers or strings; they are compared as strings.
+SCAN_IDS = []        # e.g. [1, 2, 5]
 
 # Optional: only process sessions whose label matches this regex (None = all)
 SESSION_LABEL_REGEX = None  # e.g. r"^\d{3}_MR_\d+$", r"^[A-Za-z0-9]+_MR_\d+$"
@@ -202,6 +215,32 @@ def resolve_direction() -> Tuple[str, str]:
     return SOURCE_SIDE_NAME, DEST_SIDE_NAME
 
 
+def _clean_text(v: object) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
+def _normalise_id_list(values: object) -> List[str]:
+    """
+    Normalise a config value like [1, 2, "5"] into ["1", "2", "5"].
+    Empty/blank items are discarded.
+    """
+    if values is None:
+        return []
+
+    if isinstance(values, (str, int)):
+        values = [values]
+
+    out: List[str] = []
+    for v in values:
+        s = _clean_text(v)
+        if s:
+            out.append(s)
+    return out
+
+
 def validate_runtime_config() -> None:
     missing = []
 
@@ -219,6 +258,14 @@ def validate_runtime_config() -> None:
 
     if PHASE not in {"dicom", "resources"}:
         raise ValueError("PHASE must be 'dicom' or 'resources'")
+
+    if not _clean_text(MR_SESSION_ID):
+        raise ValueError(
+            "MR_SESSION_ID must be set so the script only processes one MR session at a time."
+        )
+
+    # SCAN_IDS are optional, but if provided they are only meaningful within MR_SESSION_ID.
+    _ = _normalise_id_list(SCAN_IDS)
 
 
 def _prompt_credentials_gui(endpoint_label: str, base_url: str) -> Tuple[str, str]:
@@ -304,13 +351,6 @@ def _sleep_backoff(attempt: int) -> None:
 def _is_retryable_error(msg: str) -> bool:
     m = (msg or "").lower()
     return any(s.lower() in m for s in RETRYABLE_ERROR_SUBSTRINGS)
-
-
-def _clean_text(v: object) -> Optional[str]:
-    if v is None:
-        return None
-    s = str(v).strip()
-    return s if s else None
 
 
 def validate_zip(zip_path: Path) -> bool:
@@ -692,9 +732,16 @@ def list_source_sessions_for_subject(xsrc: XNAT, subject_label: str) -> List[Dic
     )
     expts = rs_result_list(j)
     out = [e for e in expts if "mrSessionData" in str(e.get("xsiType", ""))]
+
+    # Restrict to the requested exact MR session ID
+    target_session_id = _clean_text(MR_SESSION_ID)
+    if target_session_id:
+        out = [e for e in out if str(e.get("ID", "")) == target_session_id]
+
     if SESSION_LABEL_REGEX:
         rgx = re.compile(SESSION_LABEL_REGEX)
         out = [e for e in out if rgx.match(str(e.get("label", "")))]
+
     return out
 
 
@@ -718,6 +765,30 @@ def list_scans_by_expt_id(x: XNAT, experiment_id: str) -> List[Dict]:
         },
     )
     return rs_result_list(j)
+
+
+def select_scans_for_transfer(scans: List[Dict], session_label: str) -> List[Dict]:
+    requested_ids = set(_normalise_id_list(SCAN_IDS))
+    if not requested_ids:
+        return scans
+
+    selected: List[Dict] = []
+    found_ids: set[str] = set()
+
+    for s in scans:
+        sid = _clean_text(s.get("ID"))
+        if sid and sid in requested_ids:
+            selected.append(s)
+            found_ids.add(sid)
+
+    missing_ids = sorted(requested_ids - found_ids)
+    if missing_ids:
+        logging.warning(
+            f"[SRC] requested SCAN_IDS not found in session {session_label} "
+            f"(MR_SESSION_ID={MR_SESSION_ID}): {', '.join(missing_ids)}"
+        )
+
+    return selected
 
 
 def list_scan_resources(x: XNAT, experiment_id: str, scan_id: str) -> List[Dict]:
@@ -1023,7 +1094,10 @@ def run_dicom_phase(xsrc: XNAT, xdst: XNAT) -> None:
         logging.info(f"=== SUBJECT {subj} ===")
         sessions = list_source_sessions_for_subject(xsrc, subj)
         if not sessions:
-            logging.warning(f"[SRC] no MR sessions found for subject {subj}")
+            logging.warning(
+                f"[SRC] no matching MR session found for subject {subj} "
+                f"with MR_SESSION_ID={MR_SESSION_ID}"
+            )
             continue
 
         for sess in sessions:
@@ -1042,12 +1116,26 @@ def run_dicom_phase(xsrc: XNAT, xdst: XNAT) -> None:
             else:
                 logging.info(f"[DST] experiment id: {dst_expt_id}")
 
-            src_scans = list_scans_by_expt_id(xsrc, src_expt_id)
+            all_src_scans = list_scans_by_expt_id(xsrc, src_expt_id)
+            src_scans = select_scans_for_transfer(all_src_scans, sess_label)
+
+            if not src_scans:
+                logging.warning(
+                    f"[SRC] no scans selected for transfer in session {sess_label} "
+                    f"(MR_SESSION_ID={MR_SESSION_ID}, SCAN_IDS={_normalise_id_list(SCAN_IDS)})"
+                )
+                continue
+
             src_scan_meta_by_id: Dict[str, Dict[str, str]] = {}
             for s in src_scans:
                 sid = _clean_text(s.get("ID"))
                 if sid:
                     src_scan_meta_by_id[sid] = build_scan_metadata_from_row(s)
+
+            logging.info(
+                f"[SRC] selected {len(src_scans)} scan(s) for transfer: "
+                f"{', '.join(sorted(src_scan_meta_by_id.keys(), key=lambda x: str(x)))}"
+            )
 
             for s in src_scans:
                 scan_id = str(s.get("ID"))
@@ -1129,7 +1217,10 @@ def run_resources_phase(xsrc: XNAT, xdst: XNAT) -> None:
         logging.info(f"=== SUBJECT {subj} ===")
         sessions = list_source_sessions_for_subject(xsrc, subj)
         if not sessions:
-            logging.warning(f"[SRC] no MR sessions found for subject {subj}")
+            logging.warning(
+                f"[SRC] no matching MR session found for subject {subj} "
+                f"with MR_SESSION_ID={MR_SESSION_ID}"
+            )
             continue
 
         for sess in sessions:
@@ -1141,12 +1232,26 @@ def run_resources_phase(xsrc: XNAT, xdst: XNAT) -> None:
                 logging.error(f"[DST] could not resolve destination experiment id for {sess_label}")
                 continue
 
-            src_scans = list_scans_by_expt_id(xsrc, src_expt_id)
+            all_src_scans = list_scans_by_expt_id(xsrc, src_expt_id)
+            src_scans = select_scans_for_transfer(all_src_scans, sess_label)
+
+            if not src_scans:
+                logging.warning(
+                    f"[SRC] no scans selected for transfer in session {sess_label} "
+                    f"(MR_SESSION_ID={MR_SESSION_ID}, SCAN_IDS={_normalise_id_list(SCAN_IDS)})"
+                )
+                continue
+
             src_scan_meta_by_id: Dict[str, Dict[str, str]] = {}
             for s in src_scans:
                 sid = _clean_text(s.get("ID"))
                 if sid:
                     src_scan_meta_by_id[sid] = build_scan_metadata_from_row(s)
+
+            logging.info(
+                f"[SRC] selected {len(src_scans)} scan(s) for transfer: "
+                f"{', '.join(sorted(src_scan_meta_by_id.keys(), key=lambda x: str(x)))}"
+            )
 
             for s in src_scans:
                 scan_id = str(s.get("ID"))
@@ -1217,7 +1322,12 @@ def main() -> int:
         f"REAPPLY_AFTER_PULL={REAPPLY_SCAN_METADATA_AFTER_PULL} | "
         f"NORMALIZE_ZIPS={NORMALIZE_DOWNLOADED_ZIPS} | SORT_ZIP_ALPHA={SORT_ZIP_ENTRIES_ALPHABETICAL}"
     )
-    logging.info(f"SRC={SRC_BASE_URL} project={SRC_PROJECT} | DST={DST_BASE_URL} project={DST_PROJECT}")
+    logging.info(
+        f"SRC={SRC_BASE_URL} project={SRC_PROJECT} | DST={DST_BASE_URL} project={DST_PROJECT}"
+    )
+    logging.info(
+        f"MR_SESSION_ID={MR_SESSION_ID!r} | SCAN_IDS={_normalise_id_list(SCAN_IDS)}"
+    )
 
     try:
         # Always prompt in fixed endpoint order: A first, then B.
