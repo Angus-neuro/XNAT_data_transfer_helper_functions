@@ -8,21 +8,30 @@ WITHIN THE SAME MR SESSION (experiment), based on a partial string match.
 
 Optionally delete the source file after successful upload (move behaviour).
 
-Rules:
+Rules
+-----
 - Identify candidate source files by substring match against the resource file "Name".
 - If 0 matches: do nothing (log and exit 0).
-- If >1 matches: do nothing (log and exit 0).  **No changes are made.**
-- If exactly 1 match: download that file, upload to destination resource,
-  then optionally delete it from source (controlled by DELETE_SOURCE_AFTER_UPLOAD).
+- If >1 matches: do nothing (log and exit 0).  No changes are made.
+- If exactly 1 match: download that file, validate the staged copy, upload to the
+  destination resource, then optionally delete it from source.
 
 Credentials
 -----------
 - Username and password are prompted at runtime via pop-up windows.
+
+Key robustness improvements
+---------------------------
+- Verifies that the number of downloaded bytes matches HTTP Content-Length when present.
+- Rejects partial downloads instead of silently accepting them.
+- Optionally validates gzip integrity for .gz files.
+- Optionally validates NIfTI readability for .nii / .nii.gz files (if nibabel is available).
 """
 
 from __future__ import annotations
 
 import getpass
+import gzip
 import logging
 import time
 from pathlib import Path, PurePosixPath
@@ -36,6 +45,12 @@ try:
     from tqdm import tqdm  # type: ignore
 except Exception:
     tqdm = None
+
+# Optional NIfTI validation
+try:
+    import nibabel as nib  # type: ignore
+except Exception:
+    nib = None
 
 
 # =========================
@@ -118,6 +133,17 @@ RETRYABLE_ERROR_SUBSTRINGS = (
     "503",
     "504",
 )
+
+# -------------------------
+# VALIDATION
+# -------------------------
+
+# Validate gzip stream integrity after download for *.gz files.
+VALIDATE_GZIP_AFTER_DOWNLOAD = True
+
+# Validate NIfTI readability after download for *.nii / *.nii.gz if nibabel is available.
+# This catches header/payload mismatches before upload.
+VALIDATE_NIFTI_AFTER_DOWNLOAD = True
 
 # =========================
 # END USER CONFIG
@@ -252,6 +278,59 @@ def _make_pbar(total: Optional[int], desc: str):
     )
 
 
+def is_gzip_path(path: Path) -> bool:
+    return path.name.lower().endswith(".gz")
+
+
+def is_nifti_path(path: Path) -> bool:
+    nm = path.name.lower()
+    return nm.endswith(".nii") or nm.endswith(".nii.gz")
+
+
+def validate_gzip_file(path: Path) -> None:
+    """
+    Read the entire gzip stream to ensure it is complete and not truncated/corrupt.
+    """
+    with gzip.open(path, "rb") as f:
+        while f.read(1024 * 1024):
+            pass
+
+
+def validate_nifti_file(path: Path) -> None:
+    """
+    Fully load NIfTI data to ensure header and payload are consistent.
+    Requires nibabel.
+    """
+    if nib is None:
+        raise RuntimeError("nibabel is not available for NIfTI validation.")
+    img = nib.load(str(path))
+    _ = img.shape
+    _ = img.get_fdata(dtype="float32")
+
+
+def validate_staged_file(path: Path) -> None:
+    """
+    Run file-level integrity checks after download and before upload.
+    """
+    size = path.stat().st_size
+    if size <= 0:
+        raise RuntimeError(f"Staged file is empty: {path}")
+
+    if VALIDATE_GZIP_AFTER_DOWNLOAD and is_gzip_path(path):
+        logging.info(f"[VALIDATE] gzip integrity: {path.name}")
+        validate_gzip_file(path)
+
+    if VALIDATE_NIFTI_AFTER_DOWNLOAD and is_nifti_path(path):
+        if nib is None:
+            logging.warning(
+                "[VALIDATE] nibabel not available; skipping NIfTI validation for %s",
+                path.name,
+            )
+        else:
+            logging.info(f"[VALIDATE] NIfTI readability: {path.name}")
+            validate_nifti_file(path)
+
+
 class _ProgressFileWrapper:
     """
     Wrap a binary file object so reads update a tqdm progress bar.
@@ -328,7 +407,7 @@ class XNAT:
         progress_desc: Optional[str] = None,
     ) -> str:
         """
-        Upload a file as multipart/form-data with an optional tqdm progress bar (if tqdm is installed).
+        Upload a file as multipart/form-data with an optional tqdm progress bar.
         """
         try:
             total = None
@@ -360,40 +439,61 @@ class XNAT:
             raise RuntimeError(f"PUT(file) {path} failed: {r.status_code} {r.text[:300]}")
         return (r.text or "").strip()
 
-    def download_to_file(self, path: str, out_path: Path, params: Optional[Dict] = None, progress_desc: Optional[str] = None) -> None:
+    def download_to_file(
+        self,
+        path: str,
+        out_path: Path,
+        params: Optional[Dict] = None,
+        progress_desc: Optional[str] = None,
+    ) -> Tuple[int, Optional[int]]:
         """
-        Stream-download to a file with an optional tqdm progress bar (if tqdm is installed).
+        Stream-download to a file with an optional tqdm progress bar.
+
+        Returns
+        -------
+        (bytes_written, expected_total_from_content_length)
+
+        Raises if Content-Length is present and the download is short.
         """
         out_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = out_path.with_suffix(out_path.suffix + ".part")
 
         pbar = None
+        bytes_written = 0
+        expected_total = None
+
         try:
             with self.get(path, params=params, stream=True) as r:
                 if r.status_code >= 400:
                     raise RuntimeError(f"GET(download) {path} failed: {r.status_code} {r.text[:300]}")
 
-                total = None
                 cl = r.headers.get("Content-Length") or r.headers.get("content-length")
                 try:
                     if cl is not None:
-                        total = int(cl)
+                        expected_total = int(cl)
                 except Exception:
-                    total = None
+                    expected_total = None
 
-                pbar = _make_pbar(total, progress_desc or f"Download {out_path.name}")
+                pbar = _make_pbar(expected_total, progress_desc or f"Download {out_path.name}")
 
                 with tmp_path.open("wb") as f:
                     for chunk in r.iter_content(chunk_size=1024 * 1024):
                         if not chunk:
                             continue
                         f.write(chunk)
+                        bytes_written += len(chunk)
                         if pbar is not None:
                             pbar.update(len(chunk))
+
+            if expected_total is not None and bytes_written != expected_total:
+                raise RuntimeError(
+                    f"Incomplete download: expected {expected_total} bytes from server, got {bytes_written}"
+                )
 
             if out_path.exists():
                 out_path.unlink()
             tmp_path.rename(out_path)
+            return bytes_written, expected_total
 
         except Exception:
             try:
@@ -569,12 +669,41 @@ def download_file_with_retry(
             pass
 
         try:
-            x.download_to_file(path, out_path, params=None, progress_desc=desc)
-            if out_path.exists() and out_path.stat().st_size >= 0:
-                return
-            raise RuntimeError("Downloaded file missing after download.")
+            bytes_written, expected_total = x.download_to_file(
+                path,
+                out_path,
+                params=None,
+                progress_desc=desc,
+            )
+
+            if not out_path.exists():
+                raise RuntimeError("Downloaded file missing after download.")
+
+            disk_size = out_path.stat().st_size
+            if disk_size != bytes_written:
+                raise RuntimeError(
+                    f"Downloaded file size mismatch on disk: wrote {bytes_written} bytes, file size is {disk_size}"
+                )
+
+            if expected_total is not None:
+                logging.info(
+                    f"[XNAT] download complete: wrote {bytes_written} / expected {expected_total} bytes"
+                )
+            else:
+                logging.info(
+                    f"[XNAT] download complete: wrote {bytes_written} bytes (server gave no Content-Length)"
+                )
+
+            validate_staged_file(out_path)
+            return
+
         except Exception as e:
             logging.warning(f"[XNAT] download failed (attempt {attempt}/{DOWNLOAD_RETRIES}): {e}")
+            try:
+                if out_path.exists():
+                    out_path.unlink()
+            except Exception:
+                pass
             if attempt >= DOWNLOAD_RETRIES:
                 raise
             _sleep_backoff(attempt)
@@ -775,7 +904,7 @@ def move_single_file_between_scans(
     action_label = "move" if DELETE_SOURCE_AFTER_UPLOAD else "copy"
     logging.info(f"[PLAN] {action_label} '{src_name}' -> dst as '{dst_name}'")
 
-    # Download
+    # Download and validate
     download_file_with_retry(x, experiment_id, src_scan, src_res, src_name, staged)
 
     # Upload (optionally delete existing destination file first)
@@ -819,6 +948,9 @@ def main() -> int:
         f"DST_RENAME_TO={DST_RENAME_TO!r} | DST_FILENAME_MODE={DST_FILENAME_MODE} | "
         f"SKIP_IF_DST_EXISTS={SKIP_IF_DST_FILE_EXISTS} | OVERWRITE_DST={OVERWRITE_DST_FILE} | "
         f"DELETE_SOURCE_AFTER_UPLOAD={DELETE_SOURCE_AFTER_UPLOAD} | "
+        f"VALIDATE_GZIP_AFTER_DOWNLOAD={VALIDATE_GZIP_AFTER_DOWNLOAD} | "
+        f"VALIDATE_NIFTI_AFTER_DOWNLOAD={VALIDATE_NIFTI_AFTER_DOWNLOAD} | "
+        f"nibabel={'yes' if nib is not None else 'no'} | "
         f"tqdm={'yes' if tqdm is not None else 'no'}"
     )
     logging.info(f"XNAT={BASE_URL} project={PROJECT} subject={SUBJECT_LABEL} session={SESSION_LABEL}")
